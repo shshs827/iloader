@@ -1,0 +1,417 @@
+name: Build iloader-cli
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-cli.yml'
+
+jobs:
+  build-windows-cli:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust & cargo-zigbuild
+        shell: bash
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-pip
+          rustup target add x86_64-pc-windows-gnu
+          pip3 install --break-system-packages ziglang cargo-zigbuild
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Apply isideload patches & generate iloader-cli
+        shell: bash
+        run: |
+          python3 - << 'PYEOF'
+          import pathlib, re, sys
+
+          # 1. 修复 remote_v3/mod.rs：默认服务器改为 https://ani.jkcoxson.com 且动态拉取 /v3/client_info
+          matches = list(pathlib.Path(".").rglob("remote_v3/mod.rs"))
+          if not matches:
+              sys.exit("ERROR: 找不到 remote_v3/mod.rs")
+          anisette_path = matches[0]
+          isideload_dir = anisette_path.parents[3]
+          src_dir = isideload_dir / "src"
+          full_isideload_src = "\n".join(
+              p.read_text(encoding="utf-8", errors="ignore")
+              for p in src_dir.rglob("*.rs")
+          )
+
+          a_src = anisette_path.read_text(encoding="utf-8")
+          a_src = re.sub(r'https://ani\.[a-zA-Z0-9.-]+', 'https://ani.jkcoxson.com', a_src)
+
+          url_field_match = re.search(r'(\w+)\s*:\s*String', a_src)
+          url_field = url_field_match.group(1) if url_field_match else "url"
+          client_field_match = re.search(r'(\w+)\s*:\s*(?:reqwest::)?Client', a_src)
+          client_expr = f"self.{client_field_match.group(1)}" if client_field_match else "reqwest::Client::new()"
+
+          fn_match = re.search(
+              r'(?P<sig>(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+get_client_info\s*\([^)]*\)\s*(?:->\s*[^{]+)?)\{',
+              a_src
+          )
+          if fn_match:
+              sig = fn_match.group("sig")
+              is_async = "async " in sig
+              ret_type = sig.split("->", 1)[1].strip() if "->" in sig else ""
+              is_result = "Result" in ret_type
+
+              if not is_async:
+                  sig = sig.replace("fn get_client_info", "async fn get_client_info")
+                  a_src = re.sub(r'(\.get_client_info\(\))(?!\s*\.await)', r'\1.await', a_src)
+
+              inner_type = ret_type
+              if is_result and "<" in ret_type and ">" in ret_type:
+                  inside = ret_type[ret_type.find("<") + 1 : ret_type.rfind(">")].strip()
+                  depth_angle = 0
+                  depth_paren = 0
+                  first_arg = inside
+                  for idx, ch in enumerate(inside):
+                      if ch == "<":
+                          depth_angle += 1
+                      elif ch == ">":
+                          depth_angle -= 1
+                      elif ch == "(":
+                          depth_paren += 1
+                      elif ch == ")":
+                          depth_paren -= 1
+                      elif ch == "," and depth_angle == 0 and depth_paren == 0:
+                          first_arg = inside[:idx].strip()
+                          break
+                  inner_type = first_arg
+
+              if inner_type == "String":
+                  val_expr = "client_info"
+              elif inner_type.startswith("(") and inner_type.endswith(")"):
+                  val_expr = "(client_info, user_agent)"
+              elif inner_type.endswith("Value"):
+                  val_expr = "resp"
+              else:
+                  struct_name = inner_type.split("::")[-1]
+                  struct_def = re.search(
+                      rf'struct\s+{re.escape(struct_name)}\s*\{{([^}}]*)\}}',
+                      a_src + "\n" + full_isideload_src
+                  )
+                  if struct_def:
+                      fields = re.findall(r'(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:', struct_def.group(1))
+                      assigns = []
+                      for f in fields:
+                          if "agent" in f.lower():
+                              assigns.append(f"{f}: user_agent")
+                          else:
+                              assigns.append(f"{f}: client_info")
+                      val_expr = f"{inner_type} {{ {', '.join(assigns)} }}"
+                  else:
+                      val_expr = "(client_info, user_agent)"
+
+              ret_stmt = f"Ok({val_expr})" if is_result else val_expr
+
+              start_brace = fn_match.end() - 1
+              depth = 0
+              end_brace = start_brace
+              for idx in range(start_brace, len(a_src)):
+                  if a_src[idx] == '{':
+                      depth += 1
+                  elif a_src[idx] == '}':
+                      depth -= 1
+                      if depth == 0:
+                          end_brace = idx
+                          break
+
+              fetch_code = f"""{{
+                  let endpoint = format!("{{}}/v3/client_info", self.{url_field}.trim_end_matches('/'));
+                  let resp: serde_json::Value = {client_expr}
+                      .get(&endpoint)
+                      .send()
+                      .await?
+                      .error_for_status()?
+                      .json()
+                      .await?;
+                  let client_info = resp["client_info"]
+                      .as_str()
+                      .or_else(|| resp["Client-Info"].as_str())
+                      .unwrap_or("<MacBookPro15,1> <macOS;13.4.1;22F82> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>")
+                      .to_string();
+                  let user_agent = resp["user_agent"]
+                      .as_str()
+                      .or_else(|| resp["User-Agent"].as_str())
+                      .unwrap_or("akd/1.0 CFNetwork/1408.0.4 Darwin/22.5.0")
+                      .to_string();
+                  {ret_stmt}
+              }}"""
+              a_src = a_src[:fn_match.start()] + sig + fetch_code + a_src[end_brace + 1:]
+
+          anisette_path.write_text(a_src, encoding="utf-8")
+
+          # 2. 修复 sideloader.rs：不跳过 Watch 应用的 App Group 关联，传入 Watchos 并校验权限
+          s_matches = list(pathlib.Path(".").rglob("sideloader.rs"))
+          if not s_matches:
+              sys.exit("ERROR: 找不到 sideloader.rs")
+          sideloader_path = s_matches[0]
+
+          s_src = sideloader_path.read_text(encoding="utf-8")
+          lines = s_src.splitlines()
+          patched_lines = []
+          in_group_section = False
+
+          for i, line in enumerate(lines):
+              low = line.lower()
+              if "group" in low and ("fn " in low or "associate" in low or "app_group" in low):
+                  in_group_section = True
+              elif line.startswith("    fn ") or line.startswith("    pub fn ") or line.startswith("    async fn ") or line.startswith("    pub async fn "):
+                  in_group_section = False
+
+              if in_group_section and "watch" in low and ("continue" in low or "skip" in low):
+                  patched_lines.append(f"// [patched] {line}")
+                  continue
+
+              if in_group_section and "DeviceType::Ios" in line:
+                  var_match = re.search(r'\b(bundle|sub_app|watch_app|target|item)\b', "\n".join(lines[max(0, i-12):i+1]))
+                  var_name = var_match.group(1) if var_match else None
+                  if var_name:
+                      enum_prefix = "DeveloperDeviceType" if "DeveloperDeviceType::Ios" in line else "DeviceType"
+                      replacement = f"if {var_name}.is_watch() {{ {enum_prefix}::Watchos }} else {{ {enum_prefix}::Ios }}"
+                      line = line.replace(f"{enum_prefix}::Ios", replacement)
+
+              patched_lines.append(line)
+
+              if "download_provisioning_profile" in low and ".await" in low:
+                  indent = re.match(r'^(\s*)', line).group(1)
+                  patched_lines.append(f'{indent}if let Some(ref prof_data) = Option::Some(&profile) {{')
+                  patched_lines.append(f'{indent}    let raw_str = format!("{{:?}}", prof_data);')
+                  patched_lines.append(f'{indent}    if !raw_str.contains("application-groups") {{')
+                  patched_lines.append(f'{indent}        eprintln!("Warning: downloaded profile entitlements missing application-groups");')
+                  patched_lines.append(f'{indent}    }}')
+                  patched_lines.append(f'{indent}}}')
+
+          sideloader_path.write_text("\n".join(patched_lines) + "\n", encoding="utf-8")
+
+          # 3. 打印 isideload 与 src-tauri 的关键接口签名，并生成匹配的 iloader-cli
+          print("=== [API Inspection] ===")
+          for rel in ["lib.rs", "anisette/mod.rs", "dev/mod.rs", "sideload/mod.rs"]:
+              p = src_dir / rel
+              if p.exists():
+                  print(f"--- {rel} ---")
+                  print(p.read_text(encoding="utf-8", errors="ignore")[:1200])
+
+          sideloader_rs_txt = sideloader_path.read_text(encoding="utf-8", errors="ignore")
+          for m in re.finditer(r'pub\s+(?:async\s+)?(?:fn|struct)\s+\w+[\s\S]{0,300}?\{', sideloader_rs_txt):
+              print("--- sideloader.rs item ---")
+              print(m.group(0))
+
+          tauri_src_dir = pathlib.Path("src-tauri/src")
+          tauri_all = ""
+          if tauri_src_dir.exists():
+              for rs in tauri_src_dir.rglob("*.rs"):
+                  txt = rs.read_text(encoding="utf-8", errors="ignore")
+                  if "isideload" in txt or "sideload" in txt or "DeveloperSession" in txt:
+                      tauri_all += f"\n// FILE: {rs}\n" + txt
+                      print(f"--- {rs} (snippets) ---")
+                      for idx, ln in enumerate(txt.splitlines(), 1):
+                          if any(k in ln for k in ["isideload", "DeveloperSession", "sideload", "Anisette", "Usbmuxd", "idevice"]):
+                              print(f"L{idx}: {ln}")
+
+          # 探测 DeveloperSession 准确路径
+          dev_session_path = "isideload::dev::DeveloperSession"
+          for rs in src_dir.rglob("*.rs"):
+              if "pub struct DeveloperSession" in rs.read_text(encoding="utf-8", errors="ignore"):
+                  rel_parts = list(rs.relative_to(src_dir).with_suffix("").parts)
+                  mod_file = rs.parent / "mod.rs"
+                  mod_txt = mod_file.read_text(encoding="utf-8", errors="ignore") if mod_file.exists() else ""
+                  if rel_parts[-1] == "mod" or "pub use " in mod_txt and "DeveloperSession" in mod_txt:
+                      dev_session_path = "isideload::" + "::".join(rel_parts[:-1] + ["DeveloperSession"])
+                  else:
+                      dev_session_path = "isideload::" + "::".join(rel_parts + ["DeveloperSession"])
+                  break
+
+          # 探测 Anisette 配置类型与构造方式
+          anisette_mod_txt = (src_dir / "anisette/mod.rs").read_text(encoding="utf-8", errors="ignore") if (src_dir / "anisette/mod.rs").exists() else ""
+          anisette_type = "AnisetteConfiguration"
+          for cand in ["AnisetteConfiguration", "AnisetteClient", "AnisetteConfig", "RemoteV3AnisetteProvider", "AnisetteProvider"]:
+              if cand in anisette_mod_txt or cand in full_isideload_src:
+                  anisette_type = cand
+                  break
+
+          # 探测 DeveloperSession::login 签名
+          login_m = re.search(r'pub\s+async\s+fn\s+login\s*\(([\s\S]*?)\)\s*->', full_isideload_src)
+          login_args_raw = login_m.group(1) if login_m else ""
+          print("--- login signature ---")
+          print(login_args_raw)
+
+          # 判断 login 的 anisette 参数是值传递还是 &mut 引用
+          anisette_is_mut_ref = bool(re.search(r'&\s*mut\s+\w*Anisette', login_args_raw))
+          anisette_is_ref = bool(re.search(r'&\s*\w*Anisette', login_args_raw)) and not anisette_is_mut_ref
+          anisette_arg_expr = "&mut anisette_config" if anisette_is_mut_ref else ("&anisette_config" if anisette_is_ref else "anisette_config")
+
+          # 判断 2FA 闭包签名
+          tfa_has_arg = bool(re.search(r'Fn(?:Mut|Once)?\s*\([^)]+\)', login_args_raw))
+          tfa_head = "|_|" if tfa_has_arg else "||"
+          if "-> Result<" in login_args_raw or "-> anyhow::Result<" in login_args_raw:
+              tfa_body = 'Ok(prompt("请输入受信任设备收到的 6 位验证码: ").unwrap_or_default())'
+          elif "-> Option<" in login_args_raw:
+              tfa_body = 'Some(prompt("请输入受信任设备收到的 6 位验证码: ").unwrap_or_default())'
+          else:
+              tfa_body = 'prompt("请输入受信任设备收到的 6 位验证码: ").unwrap_or_default()'
+
+          # 探测 sideload 函数签名
+          sideload_fn_m = re.search(r'pub\s+async\s+fn\s+sideload\s*\(([\s\S]*?)\)\s*->', sideloader_rs_txt)
+          sideload_args_raw = sideload_fn_m.group(1) if sideload_fn_m else ""
+          print("--- sideload signature ---")
+          print(sideload_args_raw)
+
+          # 探测 cert 列表和吊销方法名
+          list_cert_fn = "list_certificates" if "fn list_certificates" in full_isideload_src else ("get_certificates" if "fn get_certificates" in full_isideload_src else "list_certificates")
+          revoke_cert_fn = "revoke_certificate" if "fn revoke_certificate" in full_isideload_src else ("delete_certificate" if "fn delete_certificate" in full_isideload_src else "revoke_certificate")
+
+          cert_struct_m = re.search(r'pub\s+struct\s+(?:Development)?Certificate\s*\{([^}]*)\}', full_isideload_src)
+          cert_fields = cert_struct_m.group(1) if cert_struct_m else ""
+          cert_name_expr = "cert.name" if "name:" in cert_fields else '"Certificate"'
+          cert_serial_expr = "cert.serial_number" if "serial_number:" in cert_fields else ("cert.serial" if "serial:" in cert_fields else "cert.id")
+
+          # 生成 Cargo.toml（复用 src-tauri/Cargo.toml 中 idevice / plist 等版本约束）
+          tauri_toml = pathlib.Path("src-tauri/Cargo.toml").read_text(encoding="utf-8", errors="ignore") if pathlib.Path("src-tauri/Cargo.toml").exists() else ""
+          idevice_dep_line = 'idevice = "*"'
+          for ln in tauri_toml.splitlines():
+              if ln.strip().startswith("idevice"):
+                  idevice_dep_line = ln.strip()
+                  break
+
+          cli_dir = pathlib.Path("iloader-cli/src")
+          cli_dir.mkdir(parents=True, exist_ok=True)
+
+          lock_src = pathlib.Path("src-tauri/Cargo.lock")
+          if not lock_src.exists():
+              locks = list(pathlib.Path(".").rglob("Cargo.lock"))
+              if locks:
+                  lock_src = locks[0]
+          if lock_src.exists():
+              pathlib.Path("iloader-cli/Cargo.lock").write_bytes(lock_src.read_bytes())
+
+          rel_isideload = "../" + isideload_dir.as_posix()
+          cargo_toml = f"""[package]
+          name = "iloader-cli"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          isideload = {{ path = "{rel_isideload}" }}
+          {idevice_dep_line}
+          tokio = {{ version = "1", features = ["full"] }}
+          rpassword = "7"
+          anyhow = "1"
+          rustls = {{ version = "0.23", features = ["ring"] }}
+          """
+          pathlib.Path("iloader-cli/Cargo.toml").write_text(
+              "\n".join(l.strip() for l in cargo_toml.splitlines()) + "\n",
+              encoding="utf-8"
+          )
+
+          # 根据 sideload_args_raw 构建调用参数列表
+          session_arg = "&mut session" if re.search(r'&\s*mut\s+DeveloperSession', sideload_args_raw) else "&session"
+          # 检查是否需要额外 options / callback 参数
+          extra_args = []
+          param_lines = [p.strip() for p in sideload_args_raw.split(",") if p.strip()]
+          for p in param_lines:
+              p_low = p.lower()
+              if "session" in p_low or "provider" in p_low or "device" in p_low or "path" in p_low or "ipa" in p_low or "app" in p_low:
+                  continue
+              if "option" in p_low or "config" in p_low:
+                  extra_args.append("Default::default()")
+              elif "fn" in p_low or "callback" in p_low or "progress" in p_low:
+                  extra_args.append("|_| {}")
+          extra_suffix = (", " + ", ".join(extra_args)) if extra_args else ""
+
+          main_rs = f"""use anyhow::{{Context, Result}};
+          use std::env;
+          use std::io::{{self, Write}};
+          use std::path::PathBuf;
+
+          use {dev_session_path};
+          use isideload::anisette::{anisette_type};
+          use isideload::sideload::sideloader;
+          use idevice::usbmuxd::{{UsbmuxdAddr, UsbmuxdConnection}};
+
+          fn prompt(label: &str) -> Result<String> {{
+              print!("{{}}", label);
+              io::stdout().flush()?;
+              let mut input = String::new();
+              io::stdin().read_line(&mut input)?;
+              Ok(input.trim().to_string())
+          }}
+
+          #[tokio::main]
+          async fn main() -> Result<()> {{
+              rustls::crypto::ring::default_provider()
+                  .install_default()
+                  .expect("Failed to install rustls ring provider");
+
+              let ipa_arg = env::args()
+                  .nth(1)
+                  .context("用法: iloader-cli.exe <HermesEnabler.ipa路径>")?;
+              let ipa_path = PathBuf::from(&ipa_arg);
+              if !ipa_path.exists() {{
+                  anyhow::bail!("找不到 IPA 文件: {{}}", ipa_path.display());
+              }}
+
+              println!("正在连接 usbmuxd 搜索通过 USB 连接的 iPhone...");
+              let mut usbmuxd = UsbmuxdConnection::default().await
+                  .context("无法连接 usbmuxd，请确认已安装桌面版 iTunes 且服务正常运行")?;
+              let devs = usbmuxd.get_devices().await
+                  .context("获取 USB 设备列表失败")?;
+              let dev = devs.into_iter().next()
+                  .context("未检测到已连接的 iPhone，请检查 USB 数据线并点击信任此电脑")?;
+              println!("已检测到设备 UDID: {{}}", dev.udid);
+              let provider = dev.to_provider(UsbmuxdAddr::default(), "iloader-cli");
+
+              let apple_id = prompt("Apple ID: ")?;
+              let password = rpassword::prompt_password("Password (输入时不显示): ")?;
+
+              let mut anisette_config = {anisette_type}::default();
+              let mut session = DeveloperSession::login(&apple_id, &password, {anisette_arg_expr}, {tfa_head} {{
+                  {tfa_body}
+              }})
+              .await?;
+
+              if let Err(err) = sideloader::sideload({session_arg}, &provider, &ipa_path{extra_suffix}).await {{
+                  let err_msg = format!("{{:?}}", err);
+                  if err_msg.contains("7460") {{
+                      println!("检测到 error 7460（开发证书数量已达上限），正在获取现有证书...");
+                      let certs = session.{list_cert_fn}().await?;
+                      for cert in &certs {{
+                          println!("名称: {{}} | 序列号: {{}}", {cert_name_expr}, {cert_serial_expr});
+                      }}
+                      let serial = prompt("请输入要吊销的证书序列号: ")?;
+                      session.{revoke_cert_fn}(&serial).await?;
+                      println!("旧证书已吊销，正在重新签名并推送至 iPhone 和 Apple Watch...");
+                      sideloader::sideload({session_arg}, &provider, &ipa_path{extra_suffix}).await?;
+                  }} else {{
+                      return Err(err.into());
+                  }}
+              }}
+
+              println!("DONE");
+              Ok(())
+          }}
+          """
+          pathlib.Path("iloader-cli/src/main.rs").write_text(
+              "\n".join(l[10:] if l.startswith("          ") else l for l in main_rs.splitlines()) + "\n",
+              encoding="utf-8"
+          )
+          print("Generated iloader-cli/src/main.rs successfully.")
+          PYEOF
+
+      - name: Cross-compile iloader-cli.exe
+        shell: bash
+        run: |
+          cd iloader-cli
+          cargo zigbuild --release --target x86_64-pc-windows-gnu
+
+      - name: Upload iloader-cli.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iloader-cli-windows
+          path: iloader-cli/target/x86_64-pc-windows-gnu/release/iloader-cli.exe
