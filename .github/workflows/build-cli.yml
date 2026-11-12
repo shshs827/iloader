@@ -1,0 +1,221 @@
+name: Build iloader-cli
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-cli.yml'
+
+jobs:
+  build-windows-cli:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust & cargo-zigbuild
+        shell: bash
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-pip
+          rustup target add x86_64-pc-windows-gnu
+          pip3 install --break-system-packages ziglang cargo-zigbuild
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Self-Healing Generator (Auto-fix API mismatches)
+        shell: bash
+        run: |
+          python3 - << 'PYEOF'
+          import pathlib, re, sys, subprocess
+
+          # ==========================================
+          # 1. 自动打补丁：修复 Anisette 拦截与 Watch App Group
+          # ==========================================
+          anisette_path = list(pathlib.Path(".").rglob("remote_v3/mod.rs"))[0]
+          a_src = anisette_path.read_text(encoding="utf-8")
+          a_src = re.sub(r'https://ani\.[a-zA-Z0-9.-]+', 'https://ani.jkcoxson.com', a_src)
+          url_field = re.search(r'(\w+)\s*:\s*String', a_src).group(1)
+          client_expr = f"self.{re.search(r'(\w+)\s*:\s*(?:reqwest::)?Client', a_src).group(1)}"
+          fn_match = re.search(r'(?P<sig>(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+get_client_info\s*\([^)]*\)\s*(?:->\s*[^{]+)?)\{', a_src)
+          sig = fn_match.group("sig").replace("fn get_client_info", "async fn get_client_info")
+          a_src = re.sub(r'(\.get_client_info\(\))(?!\s*\.await)', r'\1.await', a_src)
+          
+          is_result = "Result" in sig
+          ret_type = sig.split("->", 1)[1].strip() if "->" in sig else ""
+          inner_type = ret_type[ret_type.find("<")+1:ret_type.rfind(">")].strip() if is_result and "<" in ret_type else ret_type
+          inner_type = inner_type.split(",")[0].strip() if "," in inner_type and not inner_type.startswith("(") else inner_type
+
+          if inner_type == "String": val_expr = "client_info"
+          elif inner_type.startswith("("): val_expr = "(client_info, user_agent)"
+          elif inner_type.endswith("Value"): val_expr = "resp"
+          else:
+              struct_name = inner_type.split("::")[-1]
+              struct_def = re.search(rf'struct\s+{re.escape(struct_name)}\s*\{{([^}}]*)\}}', a_src + "\n" + "\n".join(p.read_text(encoding="utf-8", errors="ignore") for p in pathlib.Path("vendor/isideload/isideload/src").rglob("*.rs")))
+              if struct_def:
+                  assigns = [f"{f}: user_agent" if "agent" in f.lower() else f"{f}: client_info" for f in re.findall(r'(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:', struct_def.group(1))]
+                  val_expr = f"{inner_type} {{ {', '.join(assigns)} }}"
+              else: val_expr = "(client_info, user_agent)"
+
+          ret_stmt = f"Ok({val_expr})" if is_result else val_expr
+          start_brace = fn_match.end() - 1
+          depth, end_brace = 0, start_brace
+          for idx in range(start_brace, len(a_src)):
+              if a_src[idx] == '{': depth += 1
+              elif a_src[idx] == '}':
+                  depth -= 1
+                  if depth == 0: end_brace = idx; break
+
+          fetch_code = f"""{{
+              let endpoint = format!("{{}}/v3/client_info", self.{url_field}.trim_end_matches('/'));
+              let resp: serde_json::Value = {client_expr}.get(&endpoint).send().await?.error_for_status()?.json().await?;
+              let client_info = resp["client_info"].as_str().or_else(|| resp["Client-Info"].as_str()).unwrap_or("<MacBookPro15,1> <macOS;13.4.1;22F82> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>").to_string();
+              let user_agent = resp["user_agent"].as_str().or_else(|| resp["User-Agent"].as_str()).unwrap_or("akd/1.0 CFNetwork/1408.0.4 Darwin/22.5.0").to_string();
+              {ret_stmt}
+          }}"""
+          anisette_path.write_text(a_src[:fn_match.start()] + sig + fetch_code + a_src[end_brace + 1:], encoding="utf-8")
+
+          sideloader_path = list(pathlib.Path(".").rglob("sideloader.rs"))[0]
+          lines, patched_lines, in_group_section = sideloader_path.read_text(encoding="utf-8").splitlines(), [], False
+          for i, line in enumerate(lines):
+              low = line.lower()
+              if "group" in low and ("fn " in low or "associate" in low or "app_group" in low): in_group_section = True
+              elif line.startswith(("    fn ", "    pub fn ", "    async fn ", "    pub async fn ")): in_group_section = False
+              if in_group_section and "watch" in low and ("continue" in low or "skip" in low): continue
+              if in_group_section and "DeviceType::Ios" in line:
+                  var_name = re.search(r'\b(bundle|sub_app|watch_app|target|item)\b', "\n".join(lines[max(0, i-12):i+1]))
+                  if var_name: line = line.replace("DeviceType::Ios", f"if {var_name.group(1)}.is_watch() {{ DeviceType::Watchos }} else {{ DeviceType::Ios }}").replace("DeveloperDeviceType::Ios", f"if {var_name.group(1)}.is_watch() {{ DeveloperDeviceType::Watchos }} else {{ DeveloperDeviceType::Ios }}")
+              patched_lines.append(line)
+          sideloader_path.write_text("\n".join(patched_lines) + "\n", encoding="utf-8")
+
+          # ==========================================
+          # 2. 生成基于 AppleAccount 新 API 的 CLI 项目
+          # ==========================================
+          cli_dir = pathlib.Path("iloader-cli/src")
+          cli_dir.mkdir(parents=True, exist_ok=True)
+          if list(pathlib.Path(".").rglob("Cargo.lock")): pathlib.Path("iloader-cli/Cargo.lock").write_bytes(list(pathlib.Path(".").rglob("Cargo.lock"))[0].read_bytes())
+          
+          pathlib.Path("iloader-cli/Cargo.toml").write_text("""[package]
+          name = "iloader-cli"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          isideload = { path = "../vendor/isideload/isideload" }
+          idevice = "*"
+          tokio = { version = "1", features = ["full"] }
+          rpassword = "7"
+          anyhow = "1"
+          rustls = { version = "0.23", features = ["ring"] }
+          """.replace("          ", ""), encoding="utf-8")
+
+          base_code = """use anyhow::{Context, Result};
+          use std::env;
+          use std::io::{self, Write};
+          use std::path::PathBuf;
+          use isideload::auth::apple_account::AppleAccount;
+          use isideload::anisette::RemoteV3AnisetteProvider;
+          use isideload::sideload::sideloader::Sideloader;
+          use idevice::usbmuxd::{UsbmuxdAddr, UsbmuxdConnection};
+
+          fn prompt(label: &str) -> String { print!("{}", label); io::stdout().flush().unwrap(); let mut i = String::new(); io::stdin().read_line(&mut i).unwrap(); i.trim().to_string() }
+
+          #[tokio::main]
+          async fn main() -> Result<()> {
+              rustls::crypto::ring::default_provider().install_default().ok();
+              let ipa_path = PathBuf::from(&env::args().nth(1).context("Usage: iloader-cli.exe <ipa>")?);
+              
+              let mut usbmuxd = UsbmuxdConnection::default().await?;
+              let dev = usbmuxd.get_devices().await?.into_iter().next().context("No device")?;
+              let mut provider = dev.to_provider(UsbmuxdAddr::default(), "iloader-cli");
+              
+              let apple_id = prompt("Apple ID: ");
+              let password = rpassword::prompt_password("Password: ").unwrap_or_default();
+              let anisette = RemoteV3AnisetteProvider::default();
+              
+              <<LOGIN>>
+              <<TEAM>>
+              
+              if let Err(e) = <<SIDELOAD>> {
+                  let msg = format!("{:?}", e);
+                  if msg.contains("7460") || msg.contains("too many") {
+                      <<REVOKE>>
+                      <<SIDELOAD>>?;
+                  } else { return Err(e.into()); }
+              }
+              println!("DONE");
+              Ok(())
+          }
+          """.replace("          ", "")
+
+          code = base_code.replace("<<LOGIN>>", "let mut session = AppleAccount::builder(&apple_id).password(&password).anisette_provider(anisette).login().await?;")
+          code = code.replace("<<TEAM>>", "let teams = session.teams().await?; let team = teams.into_iter().next().context(\"No team\")?;")
+          code = code.replace("<<SIDELOAD>>", "Sideloader::new(&mut provider, &session, &team).sideload(&ipa_path).await")
+          code = code.replace("<<REVOKE>>", "let certs = team.certificates().await?; for c in &certs { println!(\"Cert: {}\", c.certificate_id); } let serial = prompt(\"Revoke cert serial: \"); team.revoke_certificate(&serial).await?;")
+
+          # ==========================================
+          # 3. 自动纠错循环 (Self-Healing Loop)
+          # ==========================================
+          for attempt in range(15):
+              pathlib.Path("iloader-cli/src/main.rs").write_text(code, encoding="utf-8")
+              res = subprocess.run(["cargo", "check", "--target", "x86_64-pc-windows-gnu"], cwd="iloader-cli", capture_output=True, text=True)
+              if res.returncode == 0:
+                  print(f"✅ Build check passed on attempt {attempt+1}!")
+                  sys.exit(0)
+                  
+              stderr = res.stderr
+              changed = False
+              print(f"⚠️ Attempt {attempt+1} failed. Applying fixes based on error...")
+
+              # Fix references
+              if "expected reference `&AppleAccount`" in stderr or "expected `&AppleAccount`, found `AppleAccount`" in stderr:
+                  code, changed = code.replace("session.clone()", "&session").replace("session,", "&session,"), True
+              if "expected reference `&DeveloperTeam`" in stderr or "expected `&DeveloperTeam`, found `DeveloperTeam`" in stderr:
+                  code, changed = code.replace("team.clone()", "&team").replace(" team)", " &team)"), True
+              if "expected struct `AppleAccount`, found `&AppleAccount`" in stderr:
+                  code, changed = code.replace("&session", "session.clone()"), True
+              if "expected struct `DeveloperTeam`, found `&DeveloperTeam`" in stderr:
+                  code, changed = code.replace("&team", "team.clone()"), True
+              if "expected reference `&" in stderr and "found struct `Provider`" in stderr:
+                  code, changed = code.replace("provider.clone()", "&provider").replace("mut provider,", "mut &provider,"), True
+              if "expected struct `Provider`, found `&mut" in stderr:
+                  code, changed = code.replace("&mut provider", "provider"), True
+              if "expected struct `String`, found `&String`" in stderr or "expected struct `String`, found `&str`" in stderr:
+                  code, changed = code.replace("&serial", "serial.clone()").replace("&apple_id", "apple_id.clone()").replace("&password", "password.clone()"), True
+
+              # Fix field names
+              if "no field `certificate_id` on type" in stderr:
+                  code, changed = code.replace("c.certificate_id", "c.serial_number"), True
+              if "no field `serial_number` on type" in stderr:
+                  code, changed = code.replace("c.serial_number", "c.id"), True
+
+              # Fix method names
+              if "no method named `revoke_certificate` found for struct `DeveloperTeam`" in stderr:
+                  code, changed = code.replace("team.revoke_certificate", "session.revoke_certificate"), True
+              if "no method named `teams`" in stderr:
+                  code, changed = code.replace("session.teams()", "session.get_teams()"), True
+              if "no method named `certificates`" in stderr:
+                  code, changed = code.replace("team.certificates()", "team.get_certificates()"), True
+              if "no method named `install_ipa`" in stderr and "sideload" in stderr:
+                  code, changed = code.replace(".install_ipa(", ".sideload("), True
+
+              # Fix login signatures (handle 2FA callback if required)
+              if "this function takes" in stderr and "arguments but" in stderr and "login" in stderr:
+                  code, changed = code.replace(".login().await?", ".login(|_| async move { Ok(prompt(\"2FA: \")) }).await?"), True
+
+              if not changed:
+                  print(f"❌ Unresolved error:\n{stderr}")
+                  sys.exit(1)
+          PYEOF
+
+      - name: Cross-compile iloader-cli.exe
+        shell: bash
+        run: |
+          cd iloader-cli
+          cargo zigbuild --release --target x86_64-pc-windows-gnu
+
+      - name: Upload iloader-cli.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iloader-cli-windows
+          path: iloader-cli/target/x86_64-pc-windows-gnu/release/iloader-cli.exe
